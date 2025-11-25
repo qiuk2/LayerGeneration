@@ -50,9 +50,9 @@ from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_f
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 from janus.models import MultiModalityCausalLM, VLChatProcessor
-from utils.reward_hps import HPSv2
-from utils.reward_git import GIT
-from utils.reward_gdino import GDino
+# from utils.reward_hps import HPSv2
+# from utils.reward_git import GIT
+# from utils.reward_gdino import GDino
 from utils.reward_orm import ORM
 import shutil
 
@@ -198,7 +198,7 @@ class JanusT2IR1Trainer(Trainer):
             #     False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             # )
             model = AutoModelForCausalLM.from_pretrained(
-                model_id, trust_remote_code=True, torch_dtype=torch.bfloat16
+                model_id, trust_remote_code=True, torch_dtype=torch.bfloat16, use_safetensors=True
             )
         else:
             model_id = model.config._name_or_path
@@ -218,14 +218,14 @@ class JanusT2IR1Trainer(Trainer):
         # remove unnecessary parameters
         # del model.vision_model
         # del model.aligner
-            
+        print("current lora config", peft_config)
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
         # Reference model
         if is_deepspeed_zero3_enabled() and args.beta != 0:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
-                model_id, trust_remote_code=True
+                model_id, trust_remote_code=True, use_safetensors=True
             )
         elif peft_config is None and args.beta != 0:
             # If PEFT configuration is not provided, create a reference model based on the initial model.
@@ -335,8 +335,8 @@ class JanusT2IR1Trainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
-            elif isinstance(reward_func, HPSv2) or isinstance(reward_func, GDino) or isinstance(reward_func, GIT):
-                reward_func.load_to_device(self.accelerator.device)
+            # elif isinstance(reward_func, HPSv2) or isinstance(reward_func, GDino) or isinstance(reward_func, GIT):
+            #     reward_func.load_to_device(self.accelerator.device)
             elif isinstance(reward_func, ORM):
                 reward_func.load_to_device(self.accelerator.device)
                 reward_func.accelerator = self.accelerator

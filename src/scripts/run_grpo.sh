@@ -12,8 +12,8 @@ HF_DATASET="../../../data/geneval_and_t2i_data_final.json"
 OUTPUT_DIR="janus/outputs/${RUN_NAME}" 
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
-torchrun --nproc_per_node="8" \
+CUDA_VISIBLE_DEVICES="2,3" \
+torchrun --nproc_per_node="2" \
 --nnodes="1" \
 --node_rank="0" \
 --master_addr="127.0.0.1" \
@@ -28,7 +28,7 @@ open_r1/grpo.py --use_vllm False \
 --temperature 1.0 \
 --num_generations 8 \
 --per_device_train_batch_size 1 \
---gradient_accumulation_steps 2 \
+--gradient_accumulation_steps 4 \
 --logging_steps 1 \
 --bf16  \
 --torch_dtype bfloat16 \
@@ -42,12 +42,12 @@ open_r1/grpo.py --use_vllm False \
 --image_token_num_per_image 576 \
 --cfg_weight 5 \
 --reasoning_prompt_path ../../../data/prompt/reasoning_prompt.txt \
---reward_funcs hps git gdino orm \
+--reward_funcs orm \
 --beta 0.01 \
 --tf32 true \
 --learning_rate 1e-6 \
---hps_ckpt_path ../../../reward_weight/HPS_v2.1_compressed.pt \
---git_ckpt_path ../../../reward_weight/git-large-vqav2 \
---gdino_ckpt_path ../../../reward_weight/groundingdino_swint_ogc.pth \
---gdino_config_path utils/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py \
---orm_ckpt_path ../../../reward_weight/ORM-T2I-R1 \
+--orm_ckpt_path ../../../reward_weight/ORM-T2I-R1
+# --use_peft true \
+# --lora_task_type CAUSAL_LM --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
+# --use_rslora true \
+# --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
