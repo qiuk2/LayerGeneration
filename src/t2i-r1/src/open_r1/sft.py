@@ -20,7 +20,7 @@ from typing import Optional
 
 from datasets import load_dataset, load_from_disk
 # from transformers import Qwen2VLForConditionalGeneration
-from transformers import TrainingArguments, get_scheduler
+from transformers import HfArgumentParser, TrainingArguments, get_scheduler
 from janus.models import MultiModalityCausalLM, VLChatProcessor
 from open_r1.trainer import JanusSFTTrainer
 
@@ -29,25 +29,33 @@ class TrainingArguments(TrainingArguments):
     reasoning_prompt_path: Optional[str] = field(
         default='',
     )
+    attn_implementation: str = "flash_attention_2"
+    dataset_name: Optional[str] = field(
+        default='',
+    )
+    model_name_or_path: str = "deepseek-ai/Janus-Pro-7B"
+    use_vllm: bool = False
+    image_token_num_per_image: int = 576
+    beta: float = 0.01
     
 
 
-def main(script_args, training_args, model_args):
+def main(args):
     # Load the dataset
-    if script_args.dataset_name.endswith('.csv'):
+    if args.dataset_name.endswith('.csv'):
         suffix = 'csv'
-    elif script_args.dataset_name.endswith('.json'):
+    elif args.dataset_name.endswith('.json'):
         suffix = 'json'
-    elif script_args.dataset_name.endswith('.parquet'):
+    elif args.dataset_name.endswith('.parquet'):
         suffix = 'parquet'
-    dataset = load_dataset(suffix, data_files=script_args.dataset_name)
+    dataset = load_dataset(suffix, data_files=args.dataset_name)
     print('Dataset length: ', len(dataset['train']))
 
     # load cot prompt
-    if training_args.reasoning_prompt_path:
-        with open(training_args.reasoning_prompt_path, 'r') as f:
+    if args.reasoning_prompt_path:
+        with open(args.reasoning_prompt_path, 'r') as f:
             cot_prompt = f.read()
-            training_args.cot_prompt = cot_prompt
+            args.cot_prompt = cot_prompt
     
             
     # Format into conversation
@@ -84,56 +92,67 @@ def main(script_args, training_args, model_args):
             "prompt": [
                 {
                     "role": "User",
-                    "content": ref_prompt.format(ori_prompt=example['ori_prompt'], gen_prompt=example['gen_prompt']),
-                    "images": [example['image_path']]
+                    "content": cot_prompt.format(example['global_prompt']),
                 },
-                {"role": "Assistant", "content": ""},
+                {"role": "Assistant", "content": f"{example['background_prompt']}\n{example['foreground_prompt']}"},
+                {
+                    "role": "User",
+                    "content": "", # TODO: check
+                },
+                {"role": "Assistant", "content": "", "images": [example['image2_path'], example['image1_path']],},
+                {
+                    "role": "User",
+                    "content": "Now combine these layer images into a final image consistent with the original prompt.",
+                    "images": [example['image2_path'], example['image1_path']],
+                },
+                {
+                    "role": "Assistant",
+                    "content": "",
+                    "images": [example['final_image_path']],
+                },
             ],
-            'raw_prompt': example['ori_prompt'],
-            'image': example['image_path'],
         }
 
 
 
-    if "image" in dataset[script_args.dataset_train_split].features or 'image_path' in dataset[script_args.dataset_train_split].features:
-        print("***************has image in dataset***************")
-        dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
+    # if "image" in dataset[args.dataset_train_split].features or 'image_path' in dataset[args.dataset_train_split].features:
+    print("***************has image in dataset***************")
+    dataset = dataset.map(make_conversation_image)  # Utilize multiprocessing for faster mapping
         # dataset = dataset.remove_columns(["original_question", "original_answer"])
 
-    else:
-        print("***************no image in dataset***************")
-        dataset = dataset.map(
-            make_conversation,
-            num_proc=1,
-            # remove_columns=['spatial_info', 'numeracy_info', 'attr_nouns', 'nouns']
-        )
-        # dataset = dataset.remove_columns("messages")
+    # else:
+    #     print("***************no image in dataset***************")
+    #     dataset = dataset.map(
+    #         make_conversation,
+    #         num_proc=1,
+    #         # remove_columns=['spatial_info', 'numeracy_info', 'attr_nouns', 'nouns']
+    #     )
+    #     # dataset = dataset.remove_columns("messages")
 
     
     trainer_cls = JanusSFTTrainer
     print("using: ", trainer_cls)
 
     # Initialize the GRPO trainer
+    print("dataset", dataset['train'][0]['prompt'])
     trainer = trainer_cls(
-        model=model_args.model_name_or_path,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
-        attn_implementation=model_args.attn_implementation,
-        script_args=script_args,
+        model=args.model_name_or_path,
+        args=args,
+        train_dataset=dataset['train'],
+        eval_dataset=None,
+        attn_implementation=args.attn_implementation,
     )
 
     # Train and push the model to the Hub
     trainer.train()
 
     # Save and push to hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    trainer.save_model(args.output_dir)
+    if args.push_to_hub:
+        trainer.push_to_hub(dataset_name=args.dataset_name)
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((TrainingArguments, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_and_config()
-    main(script_args, training_args, model_args)
+    parser = HfArgumentParser((TrainingArguments))
+    args, = parser.parse_args_into_dataclasses()
+    main(args)

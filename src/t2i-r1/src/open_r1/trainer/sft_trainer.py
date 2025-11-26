@@ -1,28 +1,145 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+'''
+Two Forward Passes
+'''
+
+import os
+import textwrap
+from collections import defaultdict
+from typing import Any, Callable, Optional, Union, List, Dict
+from PIL import Image
+
+import numpy as np
 import torch
-import torch.nn.functional as F
-from transformers import Trainer
+import torch.utils.data
+import transformers
+from datasets import Dataset, IterableDataset
+from packaging import version
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+    GenerationConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    Trainer,
+    TrainerCallback,
+    is_wandb_available,
+)
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.utils import is_peft_available
+
+from janus.models import MultiModalityCausalLM, VLChatProcessor
+
 
 class JanusSFTTrainer(Trainer):
     def __init__(
         self,
-        *args,
-        processing_class=None,            # VLChatProcessor
-        image_start_token_id=None,        # processor.image_start_tag 对应 id
-        max_prompt_length=None,
-        max_textcot_length=None,
-        image_loss_weight=1.0,
-        **kwargs
+        model: Union[str, PreTrainedModel],
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        peft_config: Optional["PeftConfig"] = None,
+        attn_implementation: str = "flash_attention_2",
+        args = None,
     ):
-        super().__init__(*args, **kwargs)
-        assert processing_class is not None
-        self.processing_class = processing_class
-        self.image_start_token_id = image_start_token_id
-        self.max_prompt_length = max_prompt_length
-        self.max_textcot_length = max_textcot_length
-        self.image_loss_weight = image_loss_weight
+        # Models
+        # Trained model
+        model_init_kwargs = {}
+        model_init_kwargs["attn_implementation"] = attn_implementation
+        if isinstance(model, str):
+            model_id = model
+            # torch_dtype = model_init_kwargs.get("torch_dtype")
+            # if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+            #     pass  # torch_dtype is already a torch.dtype or "auto" or None
+            # elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+            #     torch_dtype = getattr(torch, torch_dtype)
+            #     model_init_kwargs["torch_dtype"] = torch_dtype
+            # else:
+            #     raise ValueError(
+            #         "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+            #         f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+            #     )
+            # # Disable caching if gradient checkpointing is enabled (not supported)
+            # model_init_kwargs["use_cache"] = (
+            #     False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+            # )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, trust_remote_code=True, torch_dtype=torch.bfloat16, use_safetensors=True
+            )
+        else:
+            model_id = model.config._name_or_path
+            if args.model_init_kwargs is not None:
+                raise ValueError(
+                    "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                    "This argument can only be used when the `model` argument is a string."
+                )
+        model.language_model.config._attn_implementation == "flash_attention_2"
+        # freeze all vision encoders
+        for name, param in model.named_parameters():
+            if name.startswith("vision_model") or name.startswith("aligner") or name.startswith("gen"): # choose whatever you like here
+                param.requires_grad = False
+        # try gradient checkpointing
+        model.language_model.config.use_cache = False
+        model.language_model.gradient_checkpointing_enable()
+        # remove unnecessary parameters
+        # del model.vision_model
+        # del model.aligner
+        print("current lora config", peft_config)
+        if peft_config is not None:
+            model = get_peft_model(model, peft_config)
 
-    def _prepare_inputs(self, inputs):
-        return inputs
+        # Processing class
+        if processing_class is None:
+            processing_class: VLChatProcessor = VLChatProcessor.from_pretrained(model_id)
+        self.processing_class = processing_class
+
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=self._collate_fn,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
+        
+
+    def _collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        简单 collator：把 prompt / cot / image_tokens 等打成 list。
+        Trainer 会把这个 dict 直接传给 compute_loss。
+        """
+        prompts = [ex["prompt"] for ex in batch]
+        cots = [ex.get("cot", "") for ex in batch]  # 你现在没 cot 字段，就默认空字符串
+
+        batch_dict = {
+            "prompt": prompts,   # list of conversations
+            "cot": cots,         # list of strings
+        }
+
+        # 如果之后你在 dataset 里加了 image_tokens，也可以一起打包：
+        if "image_tokens" in batch[0]:
+            batch_dict["image_tokens"] = [ex["image_tokens"] for ex in batch]
+
+        return batch_dict
 
     def compute_loss(self, model, inputs, return_outputs=False):
         device = model.device
