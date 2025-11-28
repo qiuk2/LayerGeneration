@@ -1,0 +1,2 @@
+You are given a global text prompt: "{}" and two visual layers images: <image_placeholder> and <image_placeholder>.
+Your task is to generate a single final composite image conditioned on this text prompt and the two decomposed layer images.
