@@ -26,7 +26,10 @@ from open_r1.trainer import JanusSFTTrainer
 
 @dataclass
 class TrainingArguments(TrainingArguments):
-    reasoning_prompt_path: Optional[str] = field(
+    layer_composition_prompt_path: Optional[str] = field(
+        default='',
+    )
+    combination_prompt_path: Optional[str] = field(
         default='',
     )
     attn_implementation: str = "flash_attention_2"
@@ -37,6 +40,7 @@ class TrainingArguments(TrainingArguments):
     use_vllm: bool = False
     image_token_num_per_image: int = 576
     beta: float = 0.01
+    max_prompt_length: int = 1024
     
 
 
@@ -52,10 +56,15 @@ def main(args):
     print('Dataset length: ', len(dataset['train']))
 
     # load cot prompt
-    if args.reasoning_prompt_path:
-        with open(args.reasoning_prompt_path, 'r') as f:
-            cot_prompt = f.read()
-            args.cot_prompt = cot_prompt
+    if args.layer_composition_prompt_path:
+        with open(args.layer_composition_prompt_path, 'r') as f:
+            layer_prompt = f.read()
+            args.layer_prompt = layer_prompt
+
+    if args.combination_prompt_path:
+        with open(args.combination_prompt_path, 'r') as f:
+            combination_prompt = f.read()
+            args.combination_prompt = combination_prompt
     
             
     # Format into conversation
@@ -89,20 +98,31 @@ def main(args):
 
     def make_conversation_image(example):
         return {
-            "prompt": [
+            "layer_prompt": [
                 {
                     "role": "User",
-                    "content": cot_prompt.format(example['global_prompt']),
+                    "content": layer_prompt.format(example['global_prompt']),
                 },
                 {"role": "Assistant", "content": f"{example['background_prompt']}\n{example['foreground_prompt']}"},
+            ],
+            "generation_prompt_1": [
                 {
                     "role": "User",
-                    "content": "", # TODO: check
+                    "content": example['background_prompt'],
                 },
-                {"role": "Assistant", "content": "", "images": [example['image2_path'], example['image1_path']],},
+                {"role": "Assistant", "content": "", "images": [example['image2_path']],},
+            ],
+            "generation_prompt_2": [
                 {
                     "role": "User",
-                    "content": "Now combine these layer images into a final image consistent with the original prompt.",
+                    "content": example['foreground_prompt'],
+                },
+                {"role": "Assistant", "content": "", "images": [example['image1_path']],},
+            ],
+            "combination_prompt": [
+                {
+                    "role": "User",
+                    "content": combination_prompt.format(example['global_prompt']),
                     "images": [example['image2_path'], example['image1_path']],
                 },
                 {
@@ -110,7 +130,7 @@ def main(args):
                     "content": "",
                     "images": [example['final_image_path']],
                 },
-            ],
+            ]
         }
 
 
@@ -134,7 +154,6 @@ def main(args):
     print("using: ", trainer_cls)
 
     # Initialize the GRPO trainer
-    print("dataset", dataset['train'][0]['prompt'])
     trainer = trainer_cls(
         model=args.model_name_or_path,
         args=args,

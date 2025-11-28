@@ -27,7 +27,8 @@ seed_all(42)
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, required=True, help="Path to the model directory")
 parser.add_argument("--data_path", type=str, required=True, help="Path to the data directory")
-parser.add_argument("--reasoning_prompt_path", type=str, default="../../../data/prompt/reasoning_prompt.txt")
+parser.add_argument("--layer_prompt_path", type=str, default="../../../data/prompt/layer_prompt.txt")
+parser.add_argument("--combination_path", type=str, default="../../../data/prompt/combination_prompt.txt")
 parser.add_argument("--save_dir", type=str, default='', help="Path to the data directory")
 parser.add_argument("--num_generation", type=int, default=4)
 
@@ -48,8 +49,11 @@ with open(args.data_path, 'r') as f:
     for line in f:
         prompt_list.append(line.strip())
 
-with open(args.reasoning_prompt_path, 'r') as f:
-    cot_prompt = f.read().strip()
+with open(args.layer_prompt_path, 'r') as f:
+    layer_prompt = f.read().strip()
+
+with open(args.combination_path, 'r') as f:
+    combination_prompt = f.read().strip()
 
 
 def get_caption_height(text, font, img_width, draw):
@@ -239,6 +243,7 @@ def generate(
     img_size: int = 384,
     patch_size: int = 16,
     conversation: List[Dict[str, str]] = None,
+    combination_prompt: str = ""
 ):  
     device = 'cuda'
 
@@ -360,20 +365,13 @@ def generate(
     for i in range(completion_ids.shape[0]):
         answer = vl_chat_processor.tokenizer.decode(completion_ids[i].cpu().tolist(), skip_special_tokens=True)
         lines = [l.strip() for l in answer.splitlines() if l.strip()]
-
         if len(lines) >= 2:
             layer_lines = lines[-2:]
-            reasoning_lines = lines[:-2]
         else:
             layer_lines = lines
-            reasoning_lines = []
-        reasoning_text = " ".join(reasoning_lines).strip()
 
         for j, layer in enumerate(layer_lines):
-            if reasoning_text:
-                image_gen_prompt = f"{reasoning_text} {layer}"
-            else:
-                image_gen_prompt = f"{layer}"
+            image_gen_prompt = layer
 
             conversation = [
                 {"role": "User", "content": image_gen_prompt},
@@ -457,7 +455,7 @@ def generate(
     conversation = [
             {
                 "role": "User",
-                "content": f"{prompt_text}. Layer 1:<image_placeholder>, Layer 2:<image_placeholder>",
+                "content": combination_prompt,
                 "images": to_pil_list(composed_images)
             },
             {"role": "Assistant", "content": ""},
@@ -481,7 +479,6 @@ def generate(
     final_prompt_ids, final_attention_mask = final_prompt_inputs["input_ids"], final_prompt_inputs["attention_mask"]
     final_prompt_ids = final_prompt_ids.to(device)
     final_attention_mask = final_attention_mask.to(device)
-    print("final prom", final_prompt_ids.shape)
 
     image_start_token_id = vl_chat_processor.tokenizer.encode(vl_chat_processor.image_start_tag)[1]
     final_prompt_ids = torch.cat([final_prompt_ids, final_prompt_ids.new_full((final_prompt_ids.size(0), 1), image_start_token_id)], dim=1)
@@ -489,7 +486,7 @@ def generate(
     
     final_inputs_embeds = mmgpt.language_model.get_input_embeddings()(final_prompt_ids)
     final_tokens = sample_image_tokens_cfg(final_inputs_embeds, final_attention_mask)  # [G,576]
-
+    print(final_tokens.shape)
     # decode final
     final_dec = mmgpt.gen_vision_model.decode_code(
         final_tokens.to(dtype=torch.int),
@@ -503,7 +500,7 @@ def generate(
         # 你如果有自己的可视化函数可替换这里
         create_grid_with_captions(
             final_dec,
-            [global_prompt_str] * num_generation,
+            [sft_format] * num_generation,
             args.save_dir,
             prompt_text + " [FINAL]",
             num_generation,
@@ -522,15 +519,17 @@ def generate(
 random.shuffle(prompt_list)
 for prompt in prompt_list:
     prompt_text = copy.deepcopy(prompt)
+    combination_prompt = combination_prompt.format(prompt)
+    
     conversation = [
         {
             "role": "User",
-            "content": cot_prompt.format(prompt),
+            "content": layer_prompt.format(prompt),
         },
         {"role": "Assistant", "content": ""},
     ]
 
-    system_prompt = 'You are a helpful assistant that receives an image prompt and generate a visualization of the prompt.'
+    system_prompt = ''
     sft_format = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
         conversations=conversation,
         sft_format=vl_chat_processor.sft_format,
@@ -544,5 +543,6 @@ for prompt in prompt_list:
         prompt,
         prompt_text,
         num_generation=args.num_generation,
-        conversation=conversation
+        conversation=conversation,
+        combination_prompt=combination_prompt
     )
